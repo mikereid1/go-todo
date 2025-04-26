@@ -7,6 +7,8 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 )
@@ -44,6 +46,21 @@ func main() {
 	}
 
 	r := chi.NewRouter()
+	r.Get("/", func(w http.ResponseWriter, r *http.Request) {
+		// Build the path to your static HTML file
+		htmlPath := filepath.Join("templates", "index.html")
+
+		// Read the file
+		html, err := os.ReadFile(htmlPath)
+		if err != nil {
+			http.Error(w, "Page not found", http.StatusNotFound)
+			return
+		}
+
+		// Set content type and write to response
+		w.Header().Set("Content-Type", "text/html")
+		w.Write(html)
+	})
 	r.Route("/api", func(r chi.Router) {
 		r.Route("/v1/todos", func(r chi.Router) {
 			r.Post("/", func(w http.ResponseWriter, r *http.Request) {
