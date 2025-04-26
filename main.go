@@ -1,16 +1,13 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
-	"errors"
 	"github.com/go-chi/chi/v5"
 	"go.mongodb.org/mongo-driver/v2/bson"
-	"go.mongodb.org/mongo-driver/v2/mongo"
-	"go.mongodb.org/mongo-driver/v2/mongo/options"
 	"log"
 	"net"
 	"net/http"
+	"sync"
 	"time"
 )
 
@@ -32,13 +29,19 @@ type Todo struct {
 	UpdatedAt   string        `bson:"updatedAt"`
 }
 
+type MemoryDB struct {
+	mtx  sync.RWMutex
+	data map[string]Todo
+}
+
+var db MemoryDB
+
 func main() {
-	// init mongo
-	client, err := mongo.Connect(options.Client().ApplyURI("mongodb://localhost:27017"))
-	if err != nil {
-		log.Fatalf("Error connecting to mongo: %v", err)
+	// init db
+	db = MemoryDB{
+		mtx:  sync.RWMutex{},
+		data: make(map[string]Todo),
 	}
-	defer client.Disconnect(context.Background())
 
 	r := chi.NewRouter()
 	r.Route("/api", func(r chi.Router) {
@@ -51,6 +54,9 @@ func main() {
 					return
 				}
 
+				db.mtx.Lock()
+				defer db.mtx.Unlock()
+
 				todo := Todo{
 					Id:          bson.NewObjectID(),
 					Title:       request.Title,
@@ -59,15 +65,7 @@ func main() {
 					CreatedAt:   time.Now().UTC().Format(time.RFC3339),
 					UpdatedAt:   time.Now().UTC().Format(time.RFC3339),
 				}
-
-				_, err = client.Database("todos").
-					Collection("todos").
-					InsertOne(r.Context(), todo)
-				if err != nil {
-					log.Printf("Failed to perist Todo: %v", err)
-					http.Error(w, "something went wrong", http.StatusInternalServerError)
-					return
-				}
+				db.data[todo.Id.Hex()] = todo
 
 				response := TodoDTO{
 					Id:          todo.Id.Hex(),
@@ -82,17 +80,13 @@ func main() {
 				_ = json.NewEncoder(w).Encode(&response)
 			})
 			r.Get("/", func(w http.ResponseWriter, r *http.Request) {
-				cursor, err := client.Database("todos").Collection("todos").Find(r.Context(), bson.M{})
-				if err != nil {
-					http.Error(w, "something went wrong", http.StatusInternalServerError)
-					return
-				}
-				defer cursor.Close(r.Context())
+
+				db.mtx.RLock()
+				defer db.mtx.RUnlock()
 
 				var todos []Todo
-				if err = cursor.All(r.Context(), &todos); err != nil {
-					http.Error(w, "something went wrong", http.StatusInternalServerError)
-					return
+				for _, todo := range db.data {
+					todos = append(todos, todo)
 				}
 
 				var result []TodoDTO
@@ -113,15 +107,12 @@ func main() {
 			r.Get("/{id}", func(w http.ResponseWriter, r *http.Request) {
 				id := chi.URLParam(r, "id")
 
-				var todo Todo
-				err := client.Database("todos").Collection("todos").FindOne(r.Context(), bson.M{"id": id}).Decode(&todo)
-				if err != nil {
-					if errors.Is(err, mongo.ErrNoDocuments) {
-						http.Error(w, "todo not found", http.StatusNotFound)
-						return
-					}
-					log.Printf("Failed to decode request: %v", err)
-					http.Error(w, "something went wrong", http.StatusInternalServerError)
+				db.mtx.RLock()
+				defer db.mtx.RUnlock()
+
+				todo, exists := db.data[id]
+				if !exists {
+					http.Error(w, "todo not found", http.StatusNotFound)
 					return
 				}
 
@@ -147,15 +138,12 @@ func main() {
 					return
 				}
 
-				var todo Todo
-				err = client.Database("todos").Collection("todos").FindOne(r.Context(), bson.M{"id": id}).Decode(&todo)
-				if err != nil {
-					if errors.Is(err, mongo.ErrNoDocuments) {
-						http.Error(w, "todo not found", http.StatusNotFound)
-						return
-					}
-					log.Printf("Failed to updated todo: %v", err)
-					http.Error(w, "something went wrong", http.StatusInternalServerError)
+				db.mtx.Lock()
+				defer db.mtx.Unlock()
+
+				todo, exists := db.data[id]
+				if !exists {
+					http.Error(w, "todo not found", http.StatusNotFound)
 					return
 				}
 
@@ -164,12 +152,7 @@ func main() {
 				todo.Done = request.Done
 				todo.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
 
-				_, err = client.Database("todos").Collection("todos").InsertOne(r.Context(), todo)
-				if err != nil {
-					log.Printf("Failed to update Todo: %v", err)
-					http.Error(w, "something went wrong", http.StatusInternalServerError)
-					return
-				}
+				db.data[id] = todo
 
 				response := TodoDTO{
 					Id:          todo.Id.Hex(),
@@ -186,18 +169,17 @@ func main() {
 
 			r.Delete("/{id}", func(w http.ResponseWriter, r *http.Request) {
 				id := chi.URLParam(r, "id")
-				result, err := client.Database("todos").Collection("todos").DeleteOne(r.Context(), bson.M{"id": id})
-				if err != nil {
-					log.Printf("Failed to delete todo: %v", err)
-					http.Error(w, "something went wrong", http.StatusInternalServerError)
-					return
 
-				}
+				db.mtx.Lock()
+				_, exists := db.data[id]
+				db.mtx.Unlock()
 
-				if result.DeletedCount == 0 {
+				if !exists {
 					http.Error(w, "todo not found", http.StatusNotFound)
 					return
 				}
+
+				delete(db.data, id)
 
 				w.WriteHeader(http.StatusNoContent)
 			})
